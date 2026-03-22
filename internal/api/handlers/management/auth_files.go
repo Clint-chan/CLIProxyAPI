@@ -414,9 +414,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
-	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
-		entry["proxy_url"] = proxyURL
-	}
+	entry["proxy_url"] = strings.TrimSpace(auth.ProxyURL)
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"

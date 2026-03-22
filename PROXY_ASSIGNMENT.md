@@ -23,3 +23,12 @@ python3 scripts/assign_resin_proxies.py
 ```bash
 python3 scripts/assign_resin_proxies.py --apply
 ```
+
+**紧急回滚（清除所有 proxy 分配）：**
+```bash
+# 先 dry-run 确认范围
+python3 scripts/assign_resin_proxies.py --clear
+
+# 真实清除
+python3 scripts/assign_resin_proxies.py --clear --apply
+```

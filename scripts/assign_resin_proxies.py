@@ -17,6 +17,7 @@ from typing import Any
 DEFAULT_CLIPROXY_BASE = "http://192.168.20.204:33133"
 DEFAULT_CLIPROXY_KEY = "zxc123"
 DEFAULT_RESIN_BASE = "http://192.168.20.204:12260"
+DEFAULT_RESIN_PROXY_BASE = "http://host.docker.internal:12260"
 DEFAULT_RESIN_ADMIN_TOKEN = "zxc13875517127"
 DEFAULT_RESIN_PROXY_TOKEN = "zxc13875517127"
 DEFAULT_POOL_PREFIX = "clean"
@@ -30,6 +31,7 @@ POOL_NAME_RE = re.compile(r"^(?P<prefix>[a-zA-Z]+)(?P<index>\d+)$")
 class Pool:
     name: str
     proxy_url: str
+    probe_url: str
     routable_node_count: int
 
 
@@ -76,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cliproxy-base", default=os.getenv("CLIPROXY_BASE", DEFAULT_CLIPROXY_BASE))
     parser.add_argument("--cliproxy-key", default=os.getenv("CLIPROXY_KEY", DEFAULT_CLIPROXY_KEY))
     parser.add_argument("--resin-base", default=os.getenv("RESIN_BASE", DEFAULT_RESIN_BASE))
+    parser.add_argument("--resin-proxy-base", default=os.getenv("RESIN_PROXY_BASE", DEFAULT_RESIN_PROXY_BASE))
     parser.add_argument("--resin-admin-token", default=os.getenv("RESIN_ADMIN_TOKEN", DEFAULT_RESIN_ADMIN_TOKEN))
     parser.add_argument("--resin-proxy-token", default=os.getenv("RESIN_PROXY_TOKEN", DEFAULT_RESIN_PROXY_TOKEN))
     parser.add_argument("--pool-prefix", default=os.getenv("POOL_PREFIX", DEFAULT_POOL_PREFIX))
@@ -83,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-target", default=os.getenv("PROBE_TARGET", DEFAULT_PROBE_TARGET))
     parser.add_argument("--timeout", type=float, default=float(os.getenv("ALLOCATOR_TIMEOUT", str(DEFAULT_TIMEOUT))))
     parser.add_argument("--apply", action="store_true", help="apply changes instead of dry run")
+    parser.add_argument("--clear", action="store_true", help="clear all proxy_url assignments (dry-run unless --apply is also given)")
     parser.add_argument("--allow-missing-proxy-field", action="store_true", help="allow execution even if management API does not return proxy_url fields")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -128,7 +132,7 @@ def fetch_auth_files(client: HttpClient, base_url: str) -> list[AuthFile]:
     return auths
 
 
-def fetch_resin_pools(client: HttpClient, resin_base: str, pool_prefix: str, proxy_token: str) -> list[Pool]:
+def fetch_resin_pools(client: HttpClient, resin_base: str, resin_proxy_base: str, pool_prefix: str, proxy_token: str) -> list[Pool]:
     payload = client.request_json("GET", join_url(resin_base, "/api/v1/platforms?limit=500&sort_by=name&sort_order=asc"))
     items = payload.get("items", [])
     pools: list[Pool] = []
@@ -148,7 +152,8 @@ def fetch_resin_pools(client: HttpClient, resin_base: str, pool_prefix: str, pro
         pools.append(
             Pool(
                 name=name,
-                proxy_url=resin_proxy_url(resin_base, name, proxy_token),
+                proxy_url=resin_proxy_url(resin_proxy_base, name, proxy_token),
+                probe_url=resin_proxy_url(resin_base, name, proxy_token),
                 routable_node_count=routable,
             )
         )
@@ -216,7 +221,41 @@ def main() -> int:
 
     try:
         auth_files = fetch_auth_files(management_client, args.cliproxy_base)
-        pools = fetch_resin_pools(resin_client, args.resin_base, args.pool_prefix, args.resin_proxy_token)
+    except urllib.error.HTTPError as exc:
+        print(f"request failed: {exc}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"connection failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.clear:
+        to_clear = [a for a in auth_files if a.proxy_url]
+        print(json.dumps(
+            {
+                "mode": "apply" if args.apply else "dry-run",
+                "action": "clear",
+                "summary": {
+                    "total_auth_files": len(auth_files),
+                    "to_clear": len(to_clear),
+                },
+                "changes": [{"name": a.name, "from_proxy_url": a.proxy_url} for a in to_clear],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ))
+        if not args.apply:
+            return 0
+        failures = 0
+        for a in to_clear:
+            try:
+                patch_auth_proxy(management_client, args.cliproxy_base, a.name, "")
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"failed to clear {a.name}: {exc}", file=sys.stderr)
+        return 1 if failures else 0
+
+    try:
+        pools = fetch_resin_pools(resin_client, args.resin_base, args.resin_proxy_base, args.pool_prefix, args.resin_proxy_token)
     except urllib.error.HTTPError as exc:
         print(f"request failed: {exc}", file=sys.stderr)
         return 1
@@ -238,7 +277,7 @@ def main() -> int:
     probe_results: dict[str, tuple[bool, str]] = {}
     healthy_pools: list[Pool] = []
     for pool in pools:
-        ok, detail = probe_proxy(pool.proxy_url, args.probe_target, args.timeout)
+        ok, detail = probe_proxy(pool.probe_url, args.probe_target, args.timeout)
         probe_results[pool.proxy_url] = (ok, detail)
         if ok:
             healthy_pools.append(pool)
