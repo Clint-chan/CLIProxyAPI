@@ -942,6 +942,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 	if req.ProxyURL != nil {
 		targetAuth.ProxyURL = *req.ProxyURL
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if *req.ProxyURL == "" {
+			delete(targetAuth.Metadata, "proxy_url")
+		} else {
+			targetAuth.Metadata["proxy_url"] = *req.ProxyURL
+		}
 		changed = true
 	}
 	if req.Priority != nil || req.Note != nil {

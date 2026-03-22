@@ -184,6 +184,12 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 
 	switch {
 	case auth.Storage != nil:
+		type metadataSetter interface {
+			SetMetadata(map[string]any)
+		}
+		if ms, ok := auth.Storage.(metadataSetter); ok && auth.Metadata != nil {
+			ms.SetMetadata(auth.Metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
