@@ -1,0 +1,1 @@
+`git checkout main && git fetch origin && git merge origin/main && git push fork main`；开发时从 main 切新分支，完成后推 fork。
