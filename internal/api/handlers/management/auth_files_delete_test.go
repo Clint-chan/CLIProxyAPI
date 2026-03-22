@@ -99,6 +99,36 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFileEntry_IncludesProxyURL(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	auth := &coreauth.Auth{
+		ID:       "auth-1",
+		FileName: "auth-1.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		ProxyURL: "http://clean01:token@192.168.20.204:12260",
+		Attributes: map[string]string{
+			"path": filepath.Join(t.TempDir(), "auth-1.json"),
+		},
+	}
+	if errWrite := os.WriteFile(auth.Attributes["path"], []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected auth file entry")
+	}
+	if got, ok := entry["proxy_url"].(string); !ok || got != auth.ProxyURL {
+		t.Fatalf("proxy_url = %#v, want %q", entry["proxy_url"], auth.ProxyURL)
+	}
+}
+
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

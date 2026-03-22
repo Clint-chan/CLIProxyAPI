@@ -347,6 +347,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						fileData["note"] = trimmed
 					}
 				}
+				if pv := strings.TrimSpace(gjson.GetBytes(data, "proxy_url").String()); pv != "" {
+					fileData["proxy_url"] = pv
+				}
 			}
 
 			files = append(files, fileData)
@@ -410,6 +413,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		entry["proxy_url"] = proxyURL
 	}
 	if path != "" {
 		entry["path"] = path
