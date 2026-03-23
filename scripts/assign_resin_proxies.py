@@ -40,8 +40,13 @@ class AuthFile:
     name: str
     proxy_url: str
     status: str
+    status_message: str
+    disabled: bool
     unavailable: bool
     proxy_field_present: bool
+    last_error_code: str
+    last_error_message: str
+    last_error_http_status: int
 
 
 class HttpClient:
@@ -87,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=float(os.getenv("ALLOCATOR_TIMEOUT", str(DEFAULT_TIMEOUT))))
     parser.add_argument("--apply", action="store_true", help="apply changes instead of dry run")
     parser.add_argument("--clear", action="store_true", help="clear all proxy_url assignments (dry-run unless --apply is also given)")
+    parser.add_argument("--clear-invalidated", action="store_true", help="clear proxy_url assignments for token_invalidated auth files (dry-run unless --apply is also given)")
     parser.add_argument("--allow-missing-proxy-field", action="store_true", help="allow execution even if management API does not return proxy_url fields")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -120,13 +126,21 @@ def fetch_auth_files(client: HttpClient, base_url: str) -> list[AuthFile]:
         name = str(item.get("name", "")).strip()
         if not name:
             continue
+        last_error = item.get("last_error")
+        if not isinstance(last_error, dict):
+            last_error = {}
         auths.append(
             AuthFile(
                 name=name,
                 proxy_url=str(item.get("proxy_url", "")).strip(),
                 status=str(item.get("status", "")).strip(),
+                status_message=str(item.get("status_message", "")).strip(),
+                disabled=bool(item.get("disabled", False)),
                 unavailable=bool(item.get("unavailable", False)),
                 proxy_field_present="proxy_url" in item,
+                last_error_code=str(last_error.get("code", "")).strip(),
+                last_error_message=str(last_error.get("message", "")).strip(),
+                last_error_http_status=int(last_error.get("http_status", 0) or 0),
             )
         )
     return auths
@@ -187,7 +201,47 @@ def patch_auth_proxy(client: HttpClient, base_url: str, auth_name: str, proxy_ur
     )
 
 
+def patch_auth_disabled(client: HttpClient, base_url: str, auth_name: str, disabled: bool) -> None:
+    client.request_json(
+        "PATCH",
+        join_url(base_url, "/v0/management/auth-files/status"),
+        payload={"name": auth_name, "disabled": disabled},
+    )
+
+
+def parse_status_message_error(status_message: str) -> tuple[str, str, int]:
+    text = status_message.strip()
+    if not text:
+        return "", "", 0
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return "", "", 0
+    if not isinstance(payload, dict):
+        return "", "", 0
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return "", "", 0
+    return (
+        str(error.get("code", "")).strip(),
+        str(error.get("message", "")).strip(),
+        int(payload.get("status", 0) or 0),
+    )
+
+
+def is_invalidated(auth: AuthFile) -> bool:
+    if auth.last_error_http_status == 401 and auth.last_error_code == "token_invalidated":
+        return True
+    status_code, _message, http_status = "", "", 0
+    status_code, _message, http_status = parse_status_message_error(auth.status_message)
+    return http_status == 401 and status_code == "token_invalidated"
+
+
 def classify(auth: AuthFile, healthy_proxy_urls: set[str]) -> str:
+    if auth.disabled:
+        return "disabled"
+    if is_invalidated(auth):
+        return "invalidated"
     if not auth.proxy_url:
         return "unassigned"
     if auth.proxy_url in healthy_proxy_urls:
@@ -254,6 +308,45 @@ def main() -> int:
                 print(f"failed to clear {a.name}: {exc}", file=sys.stderr)
         return 1 if failures else 0
 
+    if args.clear_invalidated:
+        to_disable = [a for a in auth_files if is_invalidated(a) and (a.proxy_url or not a.disabled)]
+        print(json.dumps(
+            {
+                "mode": "apply" if args.apply else "dry-run",
+                "action": "clear-invalidated",
+                "summary": {
+                    "total_auth_files": len(auth_files),
+                    "invalidated_to_disable": len(to_disable),
+                },
+                "changes": [
+                    {
+                        "name": a.name,
+                        "from_proxy_url": a.proxy_url,
+                        "was_disabled": a.disabled,
+                        "last_error_code": a.last_error_code or parse_status_message_error(a.status_message)[0],
+                        "last_error_http_status": a.last_error_http_status or parse_status_message_error(a.status_message)[2],
+                        "last_error_message": a.last_error_message or parse_status_message_error(a.status_message)[1],
+                    }
+                    for a in to_disable
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ))
+        if not args.apply:
+            return 0
+        failures = 0
+        for a in to_disable:
+            try:
+                if a.proxy_url:
+                    patch_auth_proxy(management_client, args.cliproxy_base, a.name, "")
+                if not a.disabled:
+                    patch_auth_disabled(management_client, args.cliproxy_base, a.name, True)
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"failed to clear/disable invalidated {a.name}: {exc}", file=sys.stderr)
+        return 1 if failures else 0
+
     try:
         pools = fetch_resin_pools(resin_client, args.resin_base, args.resin_proxy_base, args.pool_prefix, args.resin_proxy_token)
     except urllib.error.HTTPError as exc:
@@ -274,6 +367,9 @@ def main() -> int:
         )
         return 4
 
+    invalidated_to_disable = [a for a in auth_files if is_invalidated(a) and (a.proxy_url or not a.disabled)]
+    effective_auth_files = [a for a in auth_files if not a.disabled and not is_invalidated(a)]
+
     probe_results: dict[str, tuple[bool, str]] = {}
     healthy_pools: list[Pool] = []
     for pool in pools:
@@ -293,9 +389,10 @@ def main() -> int:
 
     counts = Counter()
     unchanged: list[str] = []
+    skipped_invalidated: list[str] = [a.name for a in invalidated_to_disable]
     to_assign: list[AuthFile] = []
 
-    for auth in auth_files:
+    for auth in effective_auth_files:
         state = classify(auth, healthy_proxy_urls)
         if state == "healthy":
             counts[auth.proxy_url] += 1
@@ -326,8 +423,21 @@ def main() -> int:
             "summary": {
                 "total_auth_files": len(auth_files),
                 "unchanged": len(unchanged),
+                "disabled_invalidated": len(invalidated_to_disable),
+                "skipped_invalidated": len(skipped_invalidated),
                 "planned_changes": len(planned),
             },
+            "disabled_invalidated": [
+                {
+                    "name": a.name,
+                    "from_proxy_url": a.proxy_url,
+                    "was_disabled": a.disabled,
+                    "last_error_code": a.last_error_code or parse_status_message_error(a.status_message)[0],
+                    "last_error_http_status": a.last_error_http_status or parse_status_message_error(a.status_message)[2],
+                    "last_error_message": a.last_error_message or parse_status_message_error(a.status_message)[1],
+                }
+                for a in invalidated_to_disable
+            ],
             "changes": [
                 {
                     "name": name,
@@ -345,6 +455,15 @@ def main() -> int:
         return 0
 
     failures = 0
+    for auth in invalidated_to_disable:
+        try:
+            if auth.proxy_url:
+                patch_auth_proxy(management_client, args.cliproxy_base, auth.name, "")
+            if not auth.disabled:
+                patch_auth_disabled(management_client, args.cliproxy_base, auth.name, True)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"failed to clear/disable invalidated {auth.name}: {exc}", file=sys.stderr)
     for name, _old_proxy, new_proxy in planned:
         try:
             patch_auth_proxy(management_client, args.cliproxy_base, name, new_proxy)
